@@ -1,0 +1,16 @@
+name = "dota2"
+main = "src/worker.js"
+compatibility_date = "2026-08-01"
+
+[vars]
+# 抓取最近 N 天(含今天,按 UTC+8 划分)的已完赛 DOTA2 比赛
+DAYS = "1"
+
+# wrangler kv:namespace create GAMES_KV 后把 id 填到这里
+[[kv_namespaces]]
+binding = "GAMES_KV"
+id = "6db97639c04640838b4d8b47303fc12a"
+preview_id = "GAMES_KV_LOCAL"
+
+[triggers]
+crons = ["*/30 * * * *"]
