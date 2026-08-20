@@ -1,196 +1,112 @@
 /**
- * esports8.com DOTA2 赛果抓取与展示 Worker。
+ * DOTA2 The International 2026 赛果抓取与展示 Worker。
  *
- * - scheduled(): Cron 定时抓取最近 DAYS 天的已完赛 DOTA2 比赛每局数据,写入 KV
+ * 数据源:
+ * - OpenDota(https://api.opendota.com):比赛数据。免费公开,匿名约 60 次/分钟、
+ *   每日限额,故单局详情做 KV 永久缓存(已完赛数据不可变,每局只抓一次)
+ * - etopfun.com:每局时长大小盘赔率(公开接口,无需签名)
+ *
+ * - scheduled(): Cron 定时抓取最近 DAYS 天的比赛,写入 KV
  * - fetch(): GET / 渲染 HTML 表格; GET /refresh 手动触发一次抓取
  *
- * 签名机制(逆向自站点前端 JS):
- * - 首页 HTML 的 window.__NUXT__ 内含 s / k / l 三个字符串
- * - XOR key = AES-128-CBC-decrypt(hex(s), key=utf8(k), iv=utf8(l)),按 utf8 解码
- * - content = [排序后的 params 值拼接, unix时间戳-655876800, "js", v1路径].join("&")
- * - sign = base64( content 逐字符 charCode 与 key[(i+19)%len] 异或后的字符串, utf8 )
- * - GET 请求附加参数 k=sign
- *
- * DOTA2(game_id=3)单局 stats 数组含义(home/away 各一个):
- *   [0]总金钱 [1]推塔数 [3]一血 [4]首塔 [6]先10杀 [7]人头 [8]经济(coin-value) [9]胜方标记
- * 单局用时 = timer[3](秒)
+ * 单局字段来源(OpenDota /api/matches/{id}):
+ *   比分 radiant_score/dire_score;用时 duration;胜者 radiant_win
+ *   双方经济(coin-value) = 该方 5 名选手 net_worth 之和
+ *   一血 = firstblood_claimed=1 的选手所在方
+ *   首塔 = objectives 中首个 tower 类 building_kill 的被拆方的对方
+ *   先10杀 = 双方选手 kills_log 时间戳合并排序,先达到 10 杀的一方
+ * 系列赛: 按 series_id 归组,series_type 0/1/2 = BO1/BO3/BO5
  */
 
-const BASE = "https://www.esports8.com";
+const OPENDOTA = "https://api.opendota.com";
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
 const KV_KEY = "dota2:games";
-const REQUEST_INTERVAL_MS = 300;
+const CACHE_KEY = "dota2:gamecache"; // 单局详情永久缓存 {match_id: gameRecord}
+const ETOPFUN_INTERVAL_MS = 300;
+const OPENDOTA_INTERVAL_MS = 1100; // 匿名限额 60 次/分钟
 const CN_OFFSET_SEC = 8 * 3600; // 按东八区划分"天"
-
-// ---------- 签名 ----------
-
-function unescapeJsString(s) {
-  return s.replace(/\\u([0-9a-fA-F]{4})|\\(.)/g, (_, hex, ch) =>
-    hex ? String.fromCharCode(parseInt(hex, 16)) : ch
-  );
-}
-
-/** 从 __NUXT__ 表达式中提取 state 的 s/k/l(字面量,或经函数参数间接引用) */
-function extractSecrets(html) {
-  const marker = "window.__NUXT__=";
-  const i = html.indexOf(marker);
-  if (i < 0) throw new Error("window.__NUXT__ not found");
-  const j = html.indexOf("</script>", i);
-  const expr = html.slice(i + marker.length, j);
-
-  const re =
-    /[,{]s:([A-Za-z_$][\w$]*|"(?:[^"\\]|\\.)*"),k:([A-Za-z_$][\w$]*|"(?:[^"\\]|\\.)*"),l:([A-Za-z_$][\w$]*|"(?:[^"\\]|\\.)*")[,}]/;
-  const m = expr.match(re);
-  if (!m) throw new Error("s/k/l not found in __NUXT__");
-
-  // 解析函数参数名列表和实参列表,以便解析间接引用
-  let paramNames = null;
-  let args = null;
-  const resolve = (token) => {
-    if (token.startsWith('"')) return unescapeJsString(token.slice(1, -1));
-    if (!paramNames) {
-      const pm = expr.match(/^\(function\(([\w$,]*)\)/);
-      if (!pm) throw new Error("cannot parse __NUXT__ function params");
-      paramNames = pm[1] ? pm[1].split(",") : [];
-      args = splitTopLevelArgs(expr);
-    }
-    const idx = paramNames.indexOf(token);
-    if (idx < 0 || idx >= args.length) throw new Error(`cannot resolve __NUXT__ param ${token}`);
-    const v = args[idx].trim();
-    if (!v.startsWith('"')) throw new Error(`unexpected __NUXT__ arg for ${token}: ${v}`);
-    return unescapeJsString(v.slice(1, -1));
-  };
-  return { s: resolve(m[1]), k: resolve(m[2]), l: resolve(m[3]) };
-}
-
-/** 拆分 IIFE 末尾的实参列表(仅按顶层逗号,识别字符串) */
-function splitTopLevelArgs(expr) {
-  const start = expr.lastIndexOf("}(");
-  if (start < 0) throw new Error("cannot locate __NUXT__ argument list");
-  const body = expr.slice(start + 2, expr.lastIndexOf(")"));
-  const out = [];
-  let cur = "";
-  let inStr = false;
-  for (let i = 0; i < body.length; i++) {
-    const c = body[i];
-    if (inStr) {
-      cur += c;
-      if (c === "\\") cur += body[++i] ?? "";
-      else if (c === '"') inStr = false;
-    } else if (c === '"') {
-      inStr = true;
-      cur += c;
-    } else if (c === ",") {
-      out.push(cur);
-      cur = "";
-    } else {
-      cur += c;
-    }
-  }
-  out.push(cur);
-  return out;
-}
-
-function hexToBytes(hex) {
-  const b = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < b.length; i++) b[i] = parseInt(hex.substr(i * 2, 2), 16);
-  return b;
-}
-
-function bytesToBase64(bytes) {
-  let bin = "";
-  for (let i = 0; i < bytes.length; i += 0x8000)
-    bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
-  return btoa(bin);
-}
-
-async function deriveKey({ s, k, l }) {
-  const enc = new TextEncoder();
-  const ck = await crypto.subtle.importKey("raw", enc.encode(k), { name: "AES-CBC" }, false, [
-    "decrypt",
-  ]);
-  const plain = await crypto.subtle.decrypt(
-    { name: "AES-CBC", iv: enc.encode(l) },
-    ck,
-    hexToBytes(s)
-  );
-  return new TextDecoder().decode(plain);
-}
-
-function sign(key, params, path) {
-  const vals = Object.values(params).map(String).sort().join("");
-  const content = [vals, Math.floor(Date.now() / 1000) - 655876800, "js", path].join("&");
-  const xored = content
-    .split("")
-    .map((c, i) => String.fromCharCode(c.charCodeAt(0) ^ key.charCodeAt((i + 19) % key.length)))
-    .join("");
-  return bytesToBase64(new TextEncoder().encode(xored));
-}
-
-async function apiGetOnce(key, apiPath, params) {
-  const v1Path = apiPath.replace("/web/api/", "/v1/");
-  const q = new URLSearchParams({ ...params, k: sign(key, params, v1Path) });
-  const res = await fetch(`${BASE}${apiPath}?${q}`, {
-    headers: { "User-Agent": UA, Referer: BASE + "/en/", language: "en" },
-  });
-  const text = await res.text();
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    throw new Error(`HTTP ${res.status},非 JSON 响应: ${text.slice(0, 100).replace(/\s+/g, " ")}`);
-  }
-  if (data.code !== 0) throw new Error(`code=${data.code} ${data.msg || ""}`.trim());
-  return data.data;
-}
-
-/** 带重试的 API 调用:失败(含 520 等源站抖动)按 0.5s/1.5s 退避重试 2 次 */
-async function apiGet(key, apiPath, params = {}) {
-  let lastErr;
-  for (const delay of [0, 500, 1500]) {
-    if (delay) await sleep(delay);
-    try {
-      return await apiGetOnce(key, apiPath, params);
-    } catch (e) {
-      lastErr = e;
-    }
-  }
-  throw new Error(`API ${apiPath} error: ${lastErr.message}`);
-}
+const DEFAULT_LEAGUE_ID = "19719"; // The International 2026
+const LEAGUE_NAME = "The International 2026";
+const BO_MAP = { 0: 1, 1: 3, 2: 5 };
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-// ---------- 抓取 ----------
 
 function cnDayStart(dayOffset = 0) {
   const now = Math.floor(Date.now() / 1000);
   return Math.floor((now + CN_OFFSET_SEC) / 86400) * 86400 - CN_OFFSET_SEC - dayOffset * 86400;
 }
 
-function sideFlag(stats, idx) {
-  return Array.isArray(stats) && stats[idx] === 1;
+// ---------- OpenDota ----------
+
+async function odGetOnce(path) {
+  const res = await fetch(`${OPENDOTA}${path}`, { headers: { "User-Agent": UA } });
+  const text = await res.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(`HTTP ${res.status},非 JSON 响应: ${text.slice(0, 100).replace(/\s+/g, " ")}`);
+  }
 }
 
-function extractGame(match, tab, live) {
-  const hs = live.home?.stats || [];
-  const as = live.away?.stats || [];
-  const winnerByStats = sideFlag(hs, 9) ? match.home.name : sideFlag(as, 9) ? match.away.name : "";
-  const winner = tab.win_team?.name || winnerByStats;
-  const pick = (idx) =>
-    sideFlag(hs, idx) ? match.home.name : sideFlag(as, idx) ? match.away.name : "";
+/** 带重试的 OpenDota 调用(429/5xx 按 2s/5s 退避重试 2 次) */
+async function odGet(path) {
+  let lastErr;
+  for (const delay of [0, 2000, 5000]) {
+    if (delay) await sleep(delay);
+    try {
+      return await odGetOnce(path);
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw new Error(`opendota ${path}: ${lastErr.message}`);
+}
+
+/** 从单局详情提取页面所需字段;home=天辉,away=夜魇 */
+function extractGame(detail, teamName) {
+  const rad = detail.players.filter((p) => p.isRadiant);
+  const dire = detail.players.filter((p) => !p.isRadiant);
+  const radName = teamName(detail.radiant_team_id);
+  const direName = teamName(detail.dire_team_id);
+  const sumNW = (ps) => ps.reduce((a, p) => a + (p.net_worth || 0), 0);
+
+  // 一血归属
+  const fbPlayer = detail.players.find((p) => p.firstblood_claimed);
+  const firstBlood = fbPlayer ? (fbPlayer.isRadiant ? radName : direName) : "";
+
+  // 首塔:首个 tower 类建筑被拆,goodguys=天辉的建筑 → 夜魇拆的
+  const towerObj = (detail.objectives || []).find(
+    (o) => o.type === "building_kill" && String(o.key || "").includes("tower")
+  );
+  const firstTower = towerObj
+    ? String(towerObj.key).includes("goodguys")
+      ? direName
+      : radName
+    : "";
+
+  // 先10杀:合并双方 kills_log 时间戳,各自第 10 杀更早的一方
+  const killTimes = (ps) =>
+    ps.flatMap((p) => (p.kills_log || []).map((k) => k.time)).sort((a, b) => a - b);
+  const rt = killTimes(rad);
+  const dt = killTimes(dire);
+  const first10 = rt.length >= 10 && (dt.length < 10 || rt[9] < dt[9])
+    ? radName
+    : dt.length >= 10
+      ? direName
+      : "";
+
   return {
-    box_num: tab.box_num,
-    winner,
-    winner_conflict: Boolean(winner && winnerByStats && winner !== winnerByStats),
-    home_kills: hs[7] ?? null,
-    away_kills: as[7] ?? null,
-    duration_sec: live.timer?.[3] ?? null,
-    home_coin: hs[8] ?? null,
-    away_coin: as[8] ?? null,
-    first_10_kills: pick(6),
-    first_blood: pick(3),
-    first_tower: pick(4),
+    winner: detail.radiant_win ? radName : direName,
+    winner_conflict: false,
+    home_kills: detail.radiant_score ?? null,
+    away_kills: detail.dire_score ?? null,
+    duration_sec: detail.duration ?? null,
+    home_coin: sumNW(rad) || null,
+    away_coin: sumNW(dire) || null,
+    first_10_kills: first10,
+    first_blood: firstBlood,
+    first_tower: firstTower,
   };
 }
 
@@ -202,20 +118,27 @@ function normName(s) {
   return (s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
-/** 队名模糊匹配:规范化后相等/包含、去 team 前缀后包含、或共享 >=4 字母的单词 */
+/** 队名模糊匹配:规范化后相等/包含、去 team/gaming 前后缀后包含、共享 >=4 字母的单词、或首字母缩写一致 */
 function teamSimilar(a, b) {
   const na = normName(a);
   const nb = normName(b);
   if (!na || !nb) return false;
   if (na === nb || na.includes(nb) || nb.includes(na)) return true;
-  const strip = (t) => t.replace(/^team/, "");
+  const strip = (t) => t.replace(/^team/, "").replace(/gaming$/, "");
   const sa = strip(na);
   const sb = strip(nb);
   if (sa && sb && (sa === sb || sa.includes(sb) || sb.includes(sa))) return true;
-  const tok = (s) => (s || "").toLowerCase().split(/[^a-z0-9]+/).filter((x) => x.length >= 4);
+  const tok = (s) => (s || "").toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
   const ta = tok(a);
-  const tb = new Set(tok(b));
-  return ta.some((x) => tb.has(x));
+  const tb = tok(b);
+  if (
+    ta.some((x) => x.length >= 4 && tb.includes(x)) ||
+    tb.some((x) => x.length >= 4 && ta.includes(x))
+  )
+    return true;
+  // 首字母缩写:Vici Gaming ↔ VG
+  const acr = (ts) => ts.map((x) => x[0]).join("");
+  return acr(ta) === nb || acr(tb) === na;
 }
 
 const MATCH_TIME_TOLERANCE_SEC = 6 * 3600;
@@ -258,7 +181,7 @@ async function fetchEtopfunTimeOdds(minTimeSec, errors) {
         out.push({ timeSec, names: [m.vs1?.name, m.vs2?.name], games });
     }
     if (oldest < minTimeSec - MATCH_TIME_TOLERANCE_SEC) break;
-    await sleep(REQUEST_INTERVAL_MS);
+    await sleep(ETOPFUN_INTERVAL_MS);
   }
   return out;
 }
@@ -282,94 +205,103 @@ function matchEtopfun(rec, etopMatches) {
   return best;
 }
 
+// ---------- 抓取 ----------
+
 async function scrape(env) {
   const days = Math.max(1, parseInt(env.DAYS || "1", 10) || 1);
+  const leagueId = env.LEAGUE_ID || DEFAULT_LEAGUE_ID;
   const errors = [];
-  // 首页偶发 5xx(源站抖动),重试 3 次
-  let html = null;
-  let lastStatus = 0;
-  for (const delay of [0, 800, 2000, 4000]) {
-    if (delay) await sleep(delay);
-    const homeResp = await fetch(BASE + "/en/", { headers: { "User-Agent": UA } });
-    lastStatus = homeResp.status;
-    const text = await homeResp.text();
-    if (homeResp.ok && text.includes("window.__NUXT__")) {
-      html = text;
-      break;
-    }
-  }
-  if (!html) throw new Error(`window.__NUXT__ not found,首页最后状态 ${lastStatus}`);
-  const key = await deriveKey(extractSecrets(html));
+  const minTime = cnDayStart(days - 1);
 
-  // etopfun 时长大小盘赔率(失败不影响主流程)
-  const etopMatches = await fetchEtopfunTimeOdds(cnDayStart(days - 1), errors);
+  const [leagueMatches, teams] = await Promise.all([
+    odGet(`/api/leagues/${leagueId}/matches`),
+    odGet(`/api/teams`),
+  ]);
+  const teamMap = new Map(teams.map((t) => [t.team_id, t.name]));
+  const teamName = (id) => teamMap.get(id) || String(id ?? "?");
 
-  // 逐天取比赛列表,按 match id 去重
-  const matchMap = new Map();
-  for (let d = 0; d < days; d++) {
-    try {
-      const data = await apiGet(key, "/web/api/home/match/list", {
-        game_id: 3,
-        search_time: cnDayStart(d),
-      });
-      for (const m of data.matches || []) {
-        if (m.status_id === 3 && !matchMap.has(m.id)) matchMap.set(m.id, m);
-      }
-    } catch (e) {
-      errors.push(`match list day-${d}: ${e.message}`);
-    }
-    await sleep(REQUEST_INTERVAL_MS);
+  // 时间窗内的局,按 series_id 归组
+  const games = (leagueMatches || [])
+    .filter((m) => m.start_time >= minTime && m.duration > 0)
+    .sort((a, b) => a.start_time - b.start_time);
+  const seriesMap = new Map();
+  for (const g of games) {
+    if (!seriesMap.has(g.series_id)) seriesMap.set(g.series_id, []);
+    seriesMap.get(g.series_id).push(g);
   }
 
-  const matches = [];
-  for (const m of [...matchMap.values()].sort((a, b) => b.start_time - a.start_time)) {
-    const rec = {
-      id: m.id,
-      tournament: m.title_full_en || m.title_full_zh || "",
-      stage: m.stage_name || "",
-      start_time: m.start_time,
-      box: m.box,
-      home: { name: m.home.name, score: m.home.score },
-      away: { name: m.away.name, score: m.away.score },
-      series_winner: m.home.score > m.away.score ? m.home.name : m.away.name,
-      games: [],
-    };
-    try {
-      const nav = await apiGet(key, "/web/api/match/live_nav", { match_id: m.id });
-      await sleep(REQUEST_INTERVAL_MS);
-      for (const tab of (nav.tabs || []).filter((t) => t.is_data === 1)) {
-        try {
-          const live = await apiGet(key, "/web/api/match/live_data", {
-            match_id: m.id,
-            box_num: tab.box_num,
-          });
-          rec.games.push(extractGame(rec, tab, live));
-        } catch (e) {
-          errors.push(`live_data ${m.id}#${tab.box_num}: ${e.message}`);
+  // 单局详情:KV 永久缓存,只抓新局
+  const cache = JSON.parse((await env.GAMES_KV.get(CACHE_KEY)) || "{}");
+  let cacheDirty = false;
+  let fetched = 0;
+  for (const list of seriesMap.values()) {
+    for (const g of list) {
+      if (cache[g.match_id]) continue;
+      try {
+        const detail = await odGet(`/api/matches/${g.match_id}`);
+        if (detail && detail.players) {
+          cache[g.match_id] = extractGame(detail, teamName);
+          cacheDirty = true;
         }
-        await sleep(REQUEST_INTERVAL_MS);
+      } catch (e) {
+        errors.push(`match ${g.match_id}: ${e.message}`);
       }
-    } catch (e) {
-      errors.push(`live_nav ${m.id}: ${e.message}`);
+      fetched++;
+      await sleep(OPENDOTA_INTERVAL_MS);
+    }
+  }
+  if (cacheDirty) await env.GAMES_KV.put(CACHE_KEY, JSON.stringify(cache));
+
+  // etopfun 时长盘赔率(失败不影响主流程)
+  const etopMatches = await fetchEtopfunTimeOdds(minTime, errors);
+
+  // 组装系列赛记录
+  const matches = [];
+  let oddsMatched = 0;
+  for (const [seriesId, list] of seriesMap) {
+    const first = list[0];
+    const homeName = teamName(first.radiant_team_id);
+    const awayName = teamName(first.dire_team_id);
+    let homeScore = 0;
+    let awayScore = 0;
+    const recGames = [];
+    list.forEach((g, idx) => {
+      const cached = cache[g.match_id];
+      const winRad = g.radiant_win;
+      const winName = winRad ? teamName(g.radiant_team_id) : teamName(g.dire_team_id);
+      if (winName === homeName) homeScore++;
+      else awayScore++;
+      if (!cached) return; // 详情抓取失败,跳过该局
+      recGames.push({ box_num: idx + 1, ...cached });
+    });
+    const rec = {
+      id: String(seriesId),
+      tournament: LEAGUE_NAME,
+      stage: "",
+      start_time: first.start_time,
+      box: BO_MAP[first.series_type] || first.series_type || null,
+      home: { name: homeName, score: homeScore },
+      away: { name: awayName, score: awayScore },
+      series_winner: homeScore > awayScore ? homeName : awayName,
+      games: recGames,
+    };
+    // 关联 etopfun 赔率(按局序号对应 map)
+    const e = matchEtopfun(rec, etopMatches);
+    if (e) {
+      oddsMatched++;
+      for (const g of rec.games) {
+        const odds = e.games.get(g.box_num);
+        if (odds) Object.assign(g, odds);
+      }
     }
     matches.push(rec);
   }
-
-  // 关联 etopfun 时长大小盘赔率(按 map 号对应每一局)
-  let oddsMatched = 0;
-  for (const rec of matches) {
-    const e = matchEtopfun(rec, etopMatches);
-    if (!e) continue;
-    oddsMatched++;
-    for (const g of rec.games) {
-      const odds = e.games.get(g.box_num);
-      if (odds) Object.assign(g, odds);
-    }
-  }
+  matches.sort((a, b) => b.start_time - a.start_time);
 
   const payload = {
     updated_at: Math.floor(Date.now() / 1000),
     odds_matched: oddsMatched,
+    details_fetched: fetched,
     matches,
     errors,
   };
@@ -394,6 +326,8 @@ function fmtDate(sec) {
 function fmtCoin(v) {
   return v == null ? "" : (v / 1000).toFixed(1) + "k";
 }
+
+const pct = (n, total) => ((n / total) * 100).toFixed(1) + "%";
 
 function render(payload) {
   const rows = [];
@@ -427,18 +361,21 @@ function render(payload) {
     }
   }
   const updated = payload?.updated_at ? fmtDate(payload.updated_at) + " (UTC+8)" : "从未";
-  // 时长与 44 分钟对比统计
-  let overCount = 0;
-  let underCount = 0;
-  if (payload) {
-    for (const m of payload.matches)
-      for (const g of m.games) {
-        if (g.duration_sec == null) continue;
-        if (g.duration_sec > 44 * 60) overCount++;
-        else underCount++;
-      }
-  }
-  const total = overCount + underCount;
+  // 时长与固定分钟线对比统计(44:00 / 46:00)
+  const durations = payload
+    ? payload.matches.flatMap((m) => m.games.map((g) => g.duration_sec)).filter((s) => s != null)
+    : [];
+  const total = durations.length;
+  const fixedLineStats = [44, 46]
+    .map((min) => {
+      const over = durations.filter((s) => s > min * 60).length;
+      const under = total - over;
+      return (
+        `时长对比 ${min}:00 — <b>大时间(>${min}分钟):${over} 局(${pct(over, total)})</b> · ` +
+        `<b>小时间(≤${min}分钟):${under} 局(${pct(under, total)})</b>`
+      );
+    })
+    .join("<br>");
   // 按盘口线判定的大小统计(仅有赔率的局)
   let lineOver = 0;
   let lineUnder = 0;
@@ -452,11 +389,10 @@ function render(payload) {
   }
   const lineTotal = lineOver + lineUnder;
   const durationStats = total
-    ? `<p>时长对比 44:00 — <b>大时间(>44分钟):${overCount} 局(${(overCount / total * 100).toFixed(1)}%)</b> · ` +
-      `<b>小时间(≤44分钟):${underCount} 局(${(underCount / total * 100).toFixed(1)}%)</b>(共 ${total} 局)` +
+    ? `<p>${fixedLineStats}(共 ${total} 局)` +
       (lineTotal
-        ? `<br>按 etopfun 盘口线判定 — <b>大:${lineOver} 局(${(lineOver / lineTotal * 100).toFixed(1)}%)</b> · ` +
-          `<b>小:${lineUnder} 局(${(lineUnder / lineTotal * 100).toFixed(1)}%)</b>(有盘口的 ${lineTotal} 局,赔率列绿色为命中侧)`
+        ? `<br>按 etopfun 盘口线判定 — <b>大:${lineOver} 局(${pct(lineOver, lineTotal)})</b> · ` +
+          `<b>小:${lineUnder} 局(${pct(lineUnder, lineTotal)})</b>(有盘口的 ${lineTotal} 局,赔率列绿色为命中侧)`
         : "") +
       `</p>`
     : "";
@@ -470,12 +406,14 @@ function render(payload) {
 <th>A经济</th><th>B经济</th><th>先10杀</th><th>一血</th><th>首塔</th>
 <th>时长盘口</th><th>大赔率</th><th>小赔率</th>
 </tr></thead><tbody>${rows.join("\n")}</tbody></table>`
-    : "<p>暂无数据,等待首次抓取。</p>";
+    : payload
+      ? "<p>抓取成功,但统计区间内没有已完赛的 DOTA2 比赛(赛事空窗期)。</p>"
+      : "<p>暂无数据,等待首次抓取。</p>";
 
   return `<!doctype html>
 <html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>DOTA2 赛果 - esports8</title>
+<title>DOTA2 赛果 - ${esc(LEAGUE_NAME)}</title>
 <style>
 body{font:14px/1.5 -apple-system,"Segoe UI",Roboto,sans-serif;margin:24px;color:#e8eaf0;background:#15181e}
 h1{font-size:18px} .meta{color:#8a90a0;margin-bottom:12px} .err{color:#f2a154;font-size:12px}
@@ -485,8 +423,8 @@ th{background:#252a35;position:sticky;top:0}
 tr:nth-child(even){background:#20242e}
 .win{color:#6fd08c;font-weight:600}
 </style></head><body>
-<h1>DOTA2 已完赛比赛 · 每局数据</h1>
-<p class="meta">赛果来源 esports8.com · 时长盘口来源 etopfun.com · 更新时间:${esc(updated)} · 时间均为 UTC+8 · 绿色为该局/该盘口命中方,⚠ 表示两个数据源不一致</p>
+<h1>${esc(LEAGUE_NAME)} · 每局数据</h1>
+<p class="meta">赛果来源 OpenDota · 时长盘口来源 etopfun.com · 更新时间:${esc(updated)} · 时间均为 UTC+8 · 队伍A=天辉 队伍B=夜魇 · 绿色为该局/该盘口命中方</p>
 ${durationStats}
 ${errs}
 ${body}
@@ -506,7 +444,7 @@ export default {
       try {
         const payload = await scrape(env);
         return new Response(
-          `抓取完成:${payload.matches.length} 场比赛,${payload.errors.length} 条告警`,
+          `抓取完成:${payload.matches.length} 个系列赛,新抓 ${payload.details_fetched} 局详情,${payload.errors.length} 条告警`,
           { headers: { "Content-Type": "text/plain; charset=utf-8" } }
         );
       } catch (e) {

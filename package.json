@@ -10,6 +10,7 @@
   "type": "module",
   "private": true,
   "devDependencies": {
+    "undici": "^8.10.0",
     "wrangler": "^4.123.0"
   }
 }
