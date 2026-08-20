@@ -3,8 +3,8 @@ main = "src/worker.js"
 compatibility_date = "2026-08-01"
 
 [vars]
-# 抓取最近 N 天(含今天,按 UTC+8 划分)的已完赛 DOTA2 比赛
-DAYS = "1"
+# 抓取最近 N 天(含今天,按 UTC+8 划分);0 = 不过滤,展示联赛全部比赛
+DAYS = "0"
 # OpenDota 联赛 ID,默认 19719 = The International 2026
 # LEAGUE_ID = "19719"
 

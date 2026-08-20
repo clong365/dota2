@@ -57,9 +57,9 @@ Cloudflare Worker + KV + Cron Trigger,零 npm 运行时依赖。
 
 ## 抓取流程(scheduled / refresh)
 
-1. 并行取联赛全部局列表 + 队伍表;按 `DAYS` 时间窗(UTC+8 当日 0 点起)过滤,按 `series_id` 归组
-2. 单局详情先查 KV 缓存,未命中才调 OpenDota(限速),写回缓存
-3. 抓 etopfun 时长盘赔率(失败不影响主流程)
+1. 并行取联赛全部局列表 + 队伍表;`DAYS>0` 时按时间窗(UTC+8)过滤,`DAYS=0`(默认)展示联赛全部;按 `series_id` 归组
+2. 单局详情先查 KV 缓存,未命中才调 OpenDota(限速);受 Workers 免费版单次约 50 子请求上限约束,每次最多补 40 局,剩余记入 `pending_details` 由后续 Cron 分轮补齐,写回缓存
+3. 抓 etopfun 时长盘赔率(失败不影响主流程;翻页窗口对齐到统计范围内最早一局)
 4. 组装系列赛记录并关联赔率(按局序号对应 etopfun 的 map 号)
 5. 结果 + 抓取时间戳写入 KV key `dota2:games`
 

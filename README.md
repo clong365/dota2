@@ -47,8 +47,10 @@ npx wrangler deploy
 
 `wrangler.toml` 的 `[vars]`:
 
-- `DAYS` — 抓取最近 N 天(含今天,按 UTC+8 划分),默认 `1`
+- `DAYS` — 抓取最近 N 天(含今天,按 UTC+8 划分);`0`(默认)= 不过滤,展示联赛全部比赛
 - `LEAGUE_ID` — OpenDota 联赛 ID,默认 `19719`(The International 2026)
+
+注意:Workers 免费版单次调用约 50 个子请求上限,单局详情每次抓取最多补 40 局;首次全量回填(如 TI2026 共 109 局)由后续 Cron 自动分轮补齐,期间页面顶部会提示待补局数。
 
 ## 本地调试
 

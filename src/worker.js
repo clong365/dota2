@@ -23,8 +23,11 @@ const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
 const KV_KEY = "dota2:games";
 const CACHE_KEY = "dota2:gamecache"; // 单局详情永久缓存 {match_id: gameRecord}
+const TEAMS_KEY = "dota2:teams"; // 队伍表缓存 {updated_at, teams},7 天有效
+const TEAMS_TTL_SEC = 7 * 86400;
 const ETOPFUN_INTERVAL_MS = 300;
 const OPENDOTA_INTERVAL_MS = 1100; // 匿名限额 60 次/分钟
+const DETAILS_PER_RUN = 40; // 单次抓取最多补的单局详情数(受 Workers 子请求上限约束)
 const CN_OFFSET_SEC = 8 * 3600; // 按东八区划分"天"
 const DEFAULT_LEAGUE_ID = "19719"; // The International 2026
 const LEAGUE_NAME = "The International 2026";
@@ -42,11 +45,15 @@ function cnDayStart(dayOffset = 0) {
 async function odGetOnce(path) {
   const res = await fetch(`${OPENDOTA}${path}`, { headers: { "User-Agent": UA } });
   const text = await res.text();
+  let data;
   try {
-    return JSON.parse(text);
+    data = JSON.parse(text);
   } catch {
     throw new Error(`HTTP ${res.status},非 JSON 响应: ${text.slice(0, 100).replace(/\s+/g, " ")}`);
   }
+  // 429/5xx 也可能返回 JSON 错误体,必须按状态码判定
+  if (!res.ok) throw new Error(`HTTP ${res.status}: ${text.slice(0, 100).replace(/\s+/g, " ")}`);
+  return data;
 }
 
 /** 带重试的 OpenDota 调用(429/5xx 按 2s/5s 退避重试 2 次) */
@@ -208,15 +215,23 @@ function matchEtopfun(rec, etopMatches) {
 // ---------- 抓取 ----------
 
 async function scrape(env) {
-  const days = Math.max(1, parseInt(env.DAYS || "1", 10) || 1);
+  // DAYS<=0 表示不过滤,展示联赛全部比赛
+  const days = parseInt(env.DAYS || "0", 10) || 0;
   const leagueId = env.LEAGUE_ID || DEFAULT_LEAGUE_ID;
   const errors = [];
-  const minTime = cnDayStart(days - 1);
+  const minTime = days > 0 ? cnDayStart(days - 1) : 0;
 
-  const [leagueMatches, teams] = await Promise.all([
-    odGet(`/api/leagues/${leagueId}/matches`),
-    odGet(`/api/teams`),
-  ]);
+  // 队伍表变化极少,KV 缓存 7 天,减少请求数
+  const now = Math.floor(Date.now() / 1000);
+  let teams;
+  const teamsCache = JSON.parse((await env.GAMES_KV.get(TEAMS_KEY)) || "null");
+  if (teamsCache && now - teamsCache.updated_at < TEAMS_TTL_SEC) {
+    teams = teamsCache.teams;
+  } else {
+    teams = await odGet(`/api/teams`);
+    await env.GAMES_KV.put(TEAMS_KEY, JSON.stringify({ updated_at: now, teams }));
+  }
+  const leagueMatches = await odGet(`/api/leagues/${leagueId}/matches`);
   const teamMap = new Map(teams.map((t) => [t.team_id, t.name]));
   const teamName = (id) => teamMap.get(id) || String(id ?? "?");
 
@@ -230,21 +245,31 @@ async function scrape(env) {
     seriesMap.get(g.series_id).push(g);
   }
 
-  // 单局详情:KV 永久缓存,只抓新局
+  // 单局详情:KV 永久缓存,只抓新局。
+  // Workers 免费版单次调用约 50 个子请求上限,故每次最多补 DETAILS_PER_RUN 局,
+  // 剩余由后续 Cron 自动补齐。
   const cache = JSON.parse((await env.GAMES_KV.get(CACHE_KEY)) || "{}");
   let cacheDirty = false;
   let fetched = 0;
+  let pending = 0;
   for (const list of seriesMap.values()) {
     for (const g of list) {
       if (cache[g.match_id]) continue;
+      if (fetched >= DETAILS_PER_RUN) {
+        pending++;
+        continue;
+      }
       try {
         const detail = await odGet(`/api/matches/${g.match_id}`);
         if (detail && detail.players) {
           cache[g.match_id] = extractGame(detail, teamName);
           cacheDirty = true;
+        } else {
+          pending++;
         }
       } catch (e) {
         errors.push(`match ${g.match_id}: ${e.message}`);
+        pending++;
       }
       fetched++;
       await sleep(OPENDOTA_INTERVAL_MS);
@@ -252,8 +277,9 @@ async function scrape(env) {
   }
   if (cacheDirty) await env.GAMES_KV.put(CACHE_KEY, JSON.stringify(cache));
 
-  // etopfun 时长盘赔率(失败不影响主流程)
-  const etopMatches = await fetchEtopfunTimeOdds(minTime, errors);
+  // etopfun 时长盘赔率(失败不影响主流程;窗口对齐到最早一局)
+  const oldestGame = games.length ? games[0].start_time : minTime;
+  const etopMatches = await fetchEtopfunTimeOdds(oldestGame, errors);
 
   // 组装系列赛记录
   const matches = [];
@@ -302,6 +328,7 @@ async function scrape(env) {
     updated_at: Math.floor(Date.now() / 1000),
     odds_matched: oddsMatched,
     details_fetched: fetched,
+    pending_details: pending,
     matches,
     errors,
   };
@@ -399,6 +426,9 @@ function render(payload) {
   const errs = payload?.errors?.length
     ? `<p class="err">抓取告警 ${payload.errors.length} 条:${payload.errors.map(esc).join("; ")}</p>`
     : "";
+  const pendingNote = payload?.pending_details
+    ? `<p class="err">还有 ${payload.pending_details} 局详情待抓取,将随后续定时抓取自动补全(受单次请求数限制,每次最多补 40 局)。</p>`
+    : "";
   const body = rows.length
     ? `<table><thead><tr>
 <th>赛事</th><th>阶段</th><th>开赛时间</th><th>队伍A</th><th>队伍B</th><th>赛制</th>
@@ -426,6 +456,7 @@ tr:nth-child(even){background:#20242e}
 <h1>${esc(LEAGUE_NAME)} · 每局数据</h1>
 <p class="meta">赛果来源 OpenDota · 时长盘口来源 etopfun.com · 更新时间:${esc(updated)} · 时间均为 UTC+8 · 队伍A=天辉 队伍B=夜魇 · 绿色为该局/该盘口命中方</p>
 ${durationStats}
+${pendingNote}
 ${errs}
 ${body}
 </body></html>`;
@@ -444,7 +475,7 @@ export default {
       try {
         const payload = await scrape(env);
         return new Response(
-          `抓取完成:${payload.matches.length} 个系列赛,新抓 ${payload.details_fetched} 局详情,${payload.errors.length} 条告警`,
+          `抓取完成:${payload.matches.length} 个系列赛,新抓 ${payload.details_fetched} 局详情,待补 ${payload.pending_details} 局,${payload.errors.length} 条告警`,
           { headers: { "Content-Type": "text/plain; charset=utf-8" } }
         );
       } catch (e) {
