@@ -231,7 +231,9 @@ async function scrape(env) {
   const days = parseInt(env.DAYS || "0", 10) || 0;
   const leagueId = env.LEAGUE_ID || DEFAULT_LEAGUE_ID;
   const errors = [];
-  const minTime = days > 0 ? cnDayStart(days - 1) : 0;
+  // 起始日期(UTC+8,如 "2026-08-20"):只展示该日及以后的比赛;与 DAYS 取较严者
+  const since = Date.parse(`${env.SINCE || ""}T00:00:00+08:00`) / 1000 || 0;
+  const minTime = Math.max(days > 0 ? cnDayStart(days - 1) : 0, since);
   // OpenDota 匿名限额按共享出口 IP 计,容易耗尽;配 API key 后按 key 独立计费
   const apiKey = env.OPENDOTA_API_KEY || "";
 
@@ -312,7 +314,8 @@ async function scrape(env) {
       if (winName === homeName) homeScore++;
       else awayScore++;
       if (!cached) return; // 详情抓取失败,跳过该局
-      recGames.push({ box_num: idx + 1, ...cached });
+      // 系列赛内可能换边:单局比分固定按 队伍A:队伍B 显示,换边局需翻转
+      recGames.push({ box_num: idx + 1, swapped: g.radiant_team_id !== first.radiant_team_id, ...cached });
     });
     const rec = {
       id: String(seriesId),
@@ -366,12 +369,6 @@ function fmtDate(sec) {
   return new Date((sec + CN_OFFSET_SEC) * 1000).toISOString().replace("T", " ").slice(0, 16);
 }
 
-function fmtCoin(v) {
-  return v == null ? "" : (v / 1000).toFixed(1) + "k";
-}
-
-const pct = (n, total) => ((n / total) * 100).toFixed(1) + "%";
-
 function render(payload) {
   const rows = [];
   if (payload) {
@@ -394,16 +391,18 @@ function render(payload) {
         const kUnder = totalKills != null && g.kline != null && totalKills <= g.kline;
         const koverCls = g.kover != null && kOver ? "win" : "";
         const kunderCls = g.kunder != null && kUnder ? "win" : "";
+        // 缓存里 home_kills=该局天辉人头;换边局翻转,保证比分恒为 队伍A:队伍B
+        const killsA = g.swapped ? g.away_kills : g.home_kills;
+        const killsB = g.swapped ? g.home_kills : g.away_kills;
         rows.push(`<tr>
-<td>${esc(m.tournament)}</td><td>${esc(m.stage)}</td><td>${fmtDate(m.start_time)}</td>
+<td>${fmtDate(m.start_time)}</td>
 <td class="${homeWin ? "win" : ""}">${homeMark}</td>
 <td class="${awayWin ? "win" : ""}">${awayMark}</td>
 <td>BO${esc(m.box)}</td>
-<td>${esc(m.home.score)} : ${esc(m.away.score)}</td><td>${esc(m.series_winner)}</td>
+<td>${esc(m.home.score)} : ${esc(m.away.score)}</td>
 <td>Game ${esc(g.box_num)}</td>
-<td>${esc(g.home_kills)} : ${esc(g.away_kills)}</td><td>${fmtTime(g.duration_sec)}</td>
-<td>${fmtCoin(g.home_coin)}</td><td>${fmtCoin(g.away_coin)}</td>
-<td>${esc(g.first_10_kills)}</td><td>${esc(g.first_blood)}</td><td>${esc(g.first_tower)}</td>
+<td>${esc(killsA)} : ${esc(killsB)}</td><td>${fmtTime(g.duration_sec)}</td>
+<td>${esc(g.first_10_kills)}</td><td>${esc(g.first_blood)}</td>
 <td>${g.line != null ? esc(g.line.toFixed(1)) : ""}</td>
 <td class="${overCls}">${g.over ?? ""}</td><td class="${underCls}">${g.under ?? ""}</td>
 <td>${g.kline != null ? esc(g.kline.toFixed(1)) : ""}</td>
@@ -413,42 +412,65 @@ function render(payload) {
     }
   }
   const updated = payload?.updated_at ? fmtDate(payload.updated_at) + " (UTC+8)" : "从未";
-  // 均注大统计:每局都买大,按 etopfun 盘口线判定胜负(仅统计有盘口的局)
-  let lineOver = 0;
-  let lineUnder = 0;
+  // 均注回收对比:每局固定投 1,命中按该局赔率回收,比较均注大 vs 均注小哪边回收高
+  // (仅统计盘口、大小赔率齐全的局)
+  let dN = 0, dOverHit = 0, dOverRet = 0, dUnderRet = 0;
+  let kN = 0, kOverHit = 0, kOverRet = 0, kUnderRet = 0;
   if (payload) {
     for (const m of payload.matches)
       for (const g of m.games) {
-        if (g.duration_sec == null || g.line == null) continue;
-        if (g.duration_sec > Math.round(g.line * 60)) lineOver++;
-        else lineUnder++;
+        if (g.duration_sec != null && g.line != null && g.over != null && g.under != null) {
+          dN++;
+          if (g.duration_sec > Math.round(g.line * 60)) { dOverHit++; dOverRet += g.over; }
+          else dUnderRet += g.under;
+        }
+        if (g.home_kills != null && g.away_kills != null && g.kline != null && g.kover != null && g.kunder != null) {
+          kN++;
+          if (g.home_kills + g.away_kills > g.kline) { kOverHit++; kOverRet += g.kover; }
+          else kUnderRet += g.kunder;
+        }
       }
   }
-  const lineTotal = lineOver + lineUnder;
-  // 均注大(人头):每局都买总人头大,按 etopfun 人头盘口线判定
-  let kOverHit = 0;
-  let kUnderHit = 0;
-  if (payload) {
-    for (const m of payload.matches)
-      for (const g of m.games) {
-        if (g.home_kills == null || g.away_kills == null || g.kline == null) continue;
-        if (g.home_kills + g.away_kills > g.kline) kOverHit++;
-        else kUnderHit++;
-      }
-  }
-  const kTotal = kOverHit + kUnderHit;
+  // 两扇区派图:均注大回收 vs 均注小回收,归一化为占比
+  const pie = (name, n, overRet, underRet) => {
+    const total = overRet + underRet;
+    if (!n || total <= 0) return "";
+    const p = overRet / total;
+    const R = 56, C = 60;
+    const ang = 2 * Math.PI * p;
+    const x = (C + R * Math.sin(ang)).toFixed(2);
+    const y = (C - R * Math.cos(ang)).toFixed(2);
+    const slice =
+      p >= 1
+        ? `<circle cx="${C}" cy="${C}" r="${R}" fill="#3f7a4e"/>`
+        : `<circle cx="${C}" cy="${C}" r="${R}" fill="#b0682c"/>` +
+          (p > 0
+            ? `<path d="M ${C} ${C} L ${C} ${C - R} A ${R} ${R} 0 ${p > 0.5 ? 1 : 0} 1 ${x} ${y} Z" fill="#3f7a4e"/>`
+            : "");
+    return (
+      `<div class="pie"><div>${name}(${n} 局)</div>` +
+      `<svg viewBox="0 0 120 120">${slice}</svg>` +
+      `<div><span style="color:#6fd08c">大 ${(p * 100).toFixed(1)}%</span>(回收 ${overRet.toFixed(2)})` +
+      ` · <span style="color:#e09a54">小 ${((1 - p) * 100).toFixed(1)}%</span>(回收 ${underRet.toFixed(2)})</div></div>`
+    );
+  };
+  const pies =
+    dN || kN
+      ? `<p>均注回收占比:每局固定投 1,命中按赔率回收(港盘,回收 = 命中局赔率之和,回收 &gt; 未中局数即盈利)</p><div class="pies">` +
+        pie("时长盘", dN, dOverRet, dUnderRet) +
+        pie("人头盘", kN, kOverRet, kUnderRet) +
+        `</div>`
+      : "";
+  // 均注大命中统计(顶部文字)
+  const hitLine = (label, hit, n) =>
+    `均注大·${label}(每局买大,按 etopfun 盘口线判定) — <b>命中 ${hit} / ${n} 局` +
+    `(${((hit / n) * 100).toFixed(1)}%)</b>,未中 ${n - hit} 局`;
   const durationStats =
-    lineTotal || kTotal
+    dN || kN
       ? `<p>` +
-        (lineTotal
-          ? `均注大·时长(每局买大,按 etopfun 盘口线判定) — <b>命中 ${lineOver} / ${lineTotal} 局` +
-            `(${pct(lineOver, lineTotal)})</b>,未中 ${lineUnder} 局`
-          : "") +
-        (lineTotal && kTotal ? `<br>` : "") +
-        (kTotal
-          ? `均注大·人头(每局买大,按 etopfun 人头盘口线判定) — <b>命中 ${kOverHit} / ${kTotal} 局` +
-            `(${pct(kOverHit, kTotal)})</b>,未中 ${kUnderHit} 局`
-          : "") +
+        (dN ? hitLine("时长", dOverHit, dN) : "") +
+        (dN && kN ? `<br>` : "") +
+        (kN ? hitLine("人头", kOverHit, kN) : "") +
         `(赔率列绿色为命中侧)</p>`
       : "";
   const errs = payload?.errors?.length
@@ -459,9 +481,9 @@ function render(payload) {
     : "";
   const body = rows.length
     ? `<table><thead><tr>
-<th>赛事</th><th>阶段</th><th>开赛时间</th><th>队伍A</th><th>队伍B</th><th>赛制</th>
-<th>大比分</th><th>系列赛胜者</th><th>局</th><th>单局比分</th><th>用时</th>
-<th>A经济</th><th>B经济</th><th>先10杀</th><th>一血</th><th>首塔</th>
+<th>开赛时间</th><th>队伍A</th><th>队伍B</th><th>赛制</th>
+<th>赛果</th><th>局</th><th>单局比分</th><th>用时</th>
+<th>先10杀</th><th>一血</th>
 <th>时长盘口</th><th>大赔率</th><th>小赔率</th>
 <th>人头盘口</th><th>大赔率</th><th>小赔率</th>
 </tr></thead><tbody>${rows.join("\n")}</tbody></table>`
@@ -481,13 +503,17 @@ th,td{border:1px solid #2c313c;padding:6px 10px;text-align:left;white-space:nowr
 th{background:#252a35;position:sticky;top:0}
 tr:nth-child(even){background:#20242e}
 .win{color:#6fd08c;font-weight:600}
+.pies{display:flex;gap:48px;margin-top:16px}
+.pie{font-size:13px;color:#c9cedb;text-align:center}
+.pie svg{width:150px;height:150px;margin:6px 0}
 </style></head><body>
 <h1>${esc(LEAGUE_NAME)} · 每局数据</h1>
-<p class="meta">赛果来源 OpenDota · 盘口来源 etopfun.com · 更新时间:${esc(updated)} · 时间均为 UTC+8 · 队伍A=天辉 队伍B=夜魇 · 绿色为该局/该盘口命中方</p>
+<p class="meta">赛果来源 OpenDota · 盘口来源 etopfun.com · 更新时间:${esc(updated)} · 时间均为 UTC+8 · 单局比分 = 队伍A:队伍B · 绿色为该局/该盘口命中方</p>
 ${durationStats}
 ${pendingNote}
 ${errs}
 ${body}
+${pies}
 </body></html>`;
 }
 
