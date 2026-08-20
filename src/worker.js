@@ -42,8 +42,10 @@ function cnDayStart(dayOffset = 0) {
 
 // ---------- OpenDota ----------
 
-async function odGetOnce(path) {
-  const res = await fetch(`${OPENDOTA}${path}`, { headers: { "User-Agent": UA } });
+async function odGetOnce(path, apiKey) {
+  const sep = path.includes("?") ? "&" : "?";
+  const url = `${OPENDOTA}${path}${apiKey ? `${sep}api_key=${apiKey}` : ""}`;
+  const res = await fetch(url, { headers: { "User-Agent": UA } });
   const text = await res.text();
   let data;
   try {
@@ -56,13 +58,13 @@ async function odGetOnce(path) {
   return data;
 }
 
-/** 带重试的 OpenDota 调用(429/5xx 按 2s/5s 退避重试 2 次) */
-async function odGet(path) {
+/** 带重试的 OpenDota 调用(429/5xx 按 2s/5s 退避重试 2 次);apiKey 可空(匿名) */
+async function odGet(path, apiKey) {
   let lastErr;
   for (const delay of [0, 2000, 5000]) {
     if (delay) await sleep(delay);
     try {
-      return await odGetOnce(path);
+      return await odGetOnce(path, apiKey);
     } catch (e) {
       lastErr = e;
     }
@@ -151,8 +153,10 @@ function teamSimilar(a, b) {
 const MATCH_TIME_TOLERANCE_SEC = 6 * 3600;
 
 /**
- * 抓取 etopfun 已完赛 DOTA2 比赛的时长大小盘(type=9,vs1=大,vs2=小)。
- * 返回每场 [{timeSec, names:[n1,n2], games: Map<box_num, {line, over, under}>}]
+ * 抓取 etopfun 已完赛 DOTA2 比赛的大小盘赔率(vs1=大,vs2=小):
+ * type=9 时长盘(min),type=13 总人头盘。
+ * 返回每场 [{timeSec, names:[n1,n2], games: Map<box_num, {line, over, under}>,
+ *           killsGames: Map<box_num, {kline, kover, kunder}>}]
  */
 async function fetchEtopfunTimeOdds(minTimeSec, errors) {
   const out = [];
@@ -175,17 +179,25 @@ async function fetchEtopfunTimeOdds(minTimeSec, errors) {
       const timeSec = (m.time || 0) / 1000;
       oldest = Math.min(oldest, timeSec);
       const games = new Map();
+      const killsGames = new Map();
       for (const s of m.sublist || []) {
-        if (s.type === 9 && s.map >= 1) {
+        if (s.map < 1) continue;
+        if (s.type === 9) {
           games.set(s.map, {
             line: s.totalScore ?? null,
             over: s.vs1?.odds ?? null,
             under: s.vs2?.odds ?? null,
           });
+        } else if (s.type === 13) {
+          killsGames.set(s.map, {
+            kline: s.totalScore ?? null,
+            kover: s.vs1?.odds ?? null,
+            kunder: s.vs2?.odds ?? null,
+          });
         }
       }
-      if (games.size)
-        out.push({ timeSec, names: [m.vs1?.name, m.vs2?.name], games });
+      if (games.size || killsGames.size)
+        out.push({ timeSec, names: [m.vs1?.name, m.vs2?.name], games, killsGames });
     }
     if (oldest < minTimeSec - MATCH_TIME_TOLERANCE_SEC) break;
     await sleep(ETOPFUN_INTERVAL_MS);
@@ -220,6 +232,8 @@ async function scrape(env) {
   const leagueId = env.LEAGUE_ID || DEFAULT_LEAGUE_ID;
   const errors = [];
   const minTime = days > 0 ? cnDayStart(days - 1) : 0;
+  // OpenDota 匿名限额按共享出口 IP 计,容易耗尽;配 API key 后按 key 独立计费
+  const apiKey = env.OPENDOTA_API_KEY || "";
 
   // 队伍表变化极少,KV 缓存 7 天,减少请求数
   const now = Math.floor(Date.now() / 1000);
@@ -228,10 +242,10 @@ async function scrape(env) {
   if (teamsCache && now - teamsCache.updated_at < TEAMS_TTL_SEC) {
     teams = teamsCache.teams;
   } else {
-    teams = await odGet(`/api/teams`);
+    teams = await odGet(`/api/teams`, apiKey);
     await env.GAMES_KV.put(TEAMS_KEY, JSON.stringify({ updated_at: now, teams }));
   }
-  const leagueMatches = await odGet(`/api/leagues/${leagueId}/matches`);
+  const leagueMatches = await odGet(`/api/leagues/${leagueId}/matches`, apiKey);
   const teamMap = new Map(teams.map((t) => [t.team_id, t.name]));
   const teamName = (id) => teamMap.get(id) || String(id ?? "?");
 
@@ -260,7 +274,7 @@ async function scrape(env) {
         continue;
       }
       try {
-        const detail = await odGet(`/api/matches/${g.match_id}`);
+        const detail = await odGet(`/api/matches/${g.match_id}`, apiKey);
         if (detail && detail.players) {
           cache[g.match_id] = extractGame(detail, teamName);
           cacheDirty = true;
@@ -318,6 +332,8 @@ async function scrape(env) {
       for (const g of rec.games) {
         const odds = e.games.get(g.box_num);
         if (odds) Object.assign(g, odds);
+        const kOdds = e.killsGames.get(g.box_num);
+        if (kOdds) Object.assign(g, kOdds);
       }
     }
     matches.push(rec);
@@ -371,6 +387,13 @@ function render(payload) {
         const isOver = g.duration_sec != null && g.duration_sec > lineSec;
         const overCls = g.over != null && isOver ? "win" : "";
         const underCls = g.under != null && !isOver && g.duration_sec != null ? "win" : "";
+        // 总人头(双方击杀之和)按人头盘口线判定大小,命中的一侧高亮
+        const totalKills =
+          g.home_kills != null && g.away_kills != null ? g.home_kills + g.away_kills : null;
+        const kOver = totalKills != null && g.kline != null && totalKills > g.kline;
+        const kUnder = totalKills != null && g.kline != null && totalKills <= g.kline;
+        const koverCls = g.kover != null && kOver ? "win" : "";
+        const kunderCls = g.kunder != null && kUnder ? "win" : "";
         rows.push(`<tr>
 <td>${esc(m.tournament)}</td><td>${esc(m.stage)}</td><td>${fmtDate(m.start_time)}</td>
 <td class="${homeWin ? "win" : ""}">${homeMark}</td>
@@ -383,27 +406,14 @@ function render(payload) {
 <td>${esc(g.first_10_kills)}</td><td>${esc(g.first_blood)}</td><td>${esc(g.first_tower)}</td>
 <td>${g.line != null ? esc(g.line.toFixed(1)) : ""}</td>
 <td class="${overCls}">${g.over ?? ""}</td><td class="${underCls}">${g.under ?? ""}</td>
+<td>${g.kline != null ? esc(g.kline.toFixed(1)) : ""}</td>
+<td class="${koverCls}">${g.kover ?? ""}</td><td class="${kunderCls}">${g.kunder ?? ""}</td>
 </tr>`);
       }
     }
   }
   const updated = payload?.updated_at ? fmtDate(payload.updated_at) + " (UTC+8)" : "从未";
-  // 时长与固定分钟线对比统计(44:00 / 46:00)
-  const durations = payload
-    ? payload.matches.flatMap((m) => m.games.map((g) => g.duration_sec)).filter((s) => s != null)
-    : [];
-  const total = durations.length;
-  const fixedLineStats = [44, 46]
-    .map((min) => {
-      const over = durations.filter((s) => s > min * 60).length;
-      const under = total - over;
-      return (
-        `时长对比 ${min}:00 — <b>大时间(>${min}分钟):${over} 局(${pct(over, total)})</b> · ` +
-        `<b>小时间(≤${min}分钟):${under} 局(${pct(under, total)})</b>`
-      );
-    })
-    .join("<br>");
-  // 按盘口线判定的大小统计(仅有赔率的局)
+  // 均注大统计:每局都买大,按 etopfun 盘口线判定胜负(仅统计有盘口的局)
   let lineOver = 0;
   let lineUnder = 0;
   if (payload) {
@@ -415,14 +425,32 @@ function render(payload) {
       }
   }
   const lineTotal = lineOver + lineUnder;
-  const durationStats = total
-    ? `<p>${fixedLineStats}(共 ${total} 局)` +
-      (lineTotal
-        ? `<br>按 etopfun 盘口线判定 — <b>大:${lineOver} 局(${pct(lineOver, lineTotal)})</b> · ` +
-          `<b>小:${lineUnder} 局(${pct(lineUnder, lineTotal)})</b>(有盘口的 ${lineTotal} 局,赔率列绿色为命中侧)`
-        : "") +
-      `</p>`
-    : "";
+  // 均注大(人头):每局都买总人头大,按 etopfun 人头盘口线判定
+  let kOverHit = 0;
+  let kUnderHit = 0;
+  if (payload) {
+    for (const m of payload.matches)
+      for (const g of m.games) {
+        if (g.home_kills == null || g.away_kills == null || g.kline == null) continue;
+        if (g.home_kills + g.away_kills > g.kline) kOverHit++;
+        else kUnderHit++;
+      }
+  }
+  const kTotal = kOverHit + kUnderHit;
+  const durationStats =
+    lineTotal || kTotal
+      ? `<p>` +
+        (lineTotal
+          ? `均注大·时长(每局买大,按 etopfun 盘口线判定) — <b>命中 ${lineOver} / ${lineTotal} 局` +
+            `(${pct(lineOver, lineTotal)})</b>,未中 ${lineUnder} 局`
+          : "") +
+        (lineTotal && kTotal ? `<br>` : "") +
+        (kTotal
+          ? `均注大·人头(每局买大,按 etopfun 人头盘口线判定) — <b>命中 ${kOverHit} / ${kTotal} 局` +
+            `(${pct(kOverHit, kTotal)})</b>,未中 ${kUnderHit} 局`
+          : "") +
+        `(赔率列绿色为命中侧)</p>`
+      : "";
   const errs = payload?.errors?.length
     ? `<p class="err">抓取告警 ${payload.errors.length} 条:${payload.errors.map(esc).join("; ")}</p>`
     : "";
@@ -435,6 +463,7 @@ function render(payload) {
 <th>大比分</th><th>系列赛胜者</th><th>局</th><th>单局比分</th><th>用时</th>
 <th>A经济</th><th>B经济</th><th>先10杀</th><th>一血</th><th>首塔</th>
 <th>时长盘口</th><th>大赔率</th><th>小赔率</th>
+<th>人头盘口</th><th>大赔率</th><th>小赔率</th>
 </tr></thead><tbody>${rows.join("\n")}</tbody></table>`
     : payload
       ? "<p>抓取成功,但统计区间内没有已完赛的 DOTA2 比赛(赛事空窗期)。</p>"
@@ -454,7 +483,7 @@ tr:nth-child(even){background:#20242e}
 .win{color:#6fd08c;font-weight:600}
 </style></head><body>
 <h1>${esc(LEAGUE_NAME)} · 每局数据</h1>
-<p class="meta">赛果来源 OpenDota · 时长盘口来源 etopfun.com · 更新时间:${esc(updated)} · 时间均为 UTC+8 · 队伍A=天辉 队伍B=夜魇 · 绿色为该局/该盘口命中方</p>
+<p class="meta">赛果来源 OpenDota · 盘口来源 etopfun.com · 更新时间:${esc(updated)} · 时间均为 UTC+8 · 队伍A=天辉 队伍B=夜魇 · 绿色为该局/该盘口命中方</p>
 ${durationStats}
 ${pendingNote}
 ${errs}
@@ -464,15 +493,44 @@ ${body}
 
 // ---------- 入口 ----------
 
+const DISABLED_KEY = "dota2:disabled"; // 赛事结束标记:存在则 Cron 永久停抓
+
+/**
+ * 定时抓取闸门,尽量减少 OpenDota 调用(按调用次数计费):
+ * - 比赛时段(UTC+8 ACTIVE_START_HOUR 点至 ACTIVE_END_HOUR 点)之外直接跳过
+ * - 赛事结束后(最新一场比赛超过 STALE_DAYS 天)写入结束标记,Cron 永久停抓;
+ *   不会自动恢复,访问一次 /refresh 清除标记并立即抓取,即为手动恢复
+ */
+async function scheduledShouldRun(env) {
+  if (await env.GAMES_KV.get(DISABLED_KEY)) return false;
+  const startH = parseInt(env.ACTIVE_START_HOUR || "9", 10); // UTC+8
+  const endH = parseInt(env.ACTIVE_END_HOUR || "24", 10); // 24 = 午夜
+  const hourCN = new Date(Date.now() + 8 * 3600 * 1000).getUTCHours();
+  if (hourCN < startH || hourCN >= endH) return false;
+  const staleDays = parseInt(env.STALE_DAYS || "5", 10);
+  if (staleDays > 0) {
+    const raw = await env.GAMES_KV.get(KV_KEY);
+    const payload = raw ? JSON.parse(raw) : null;
+    const newest = payload?.matches?.[0]?.start_time; // matches 按开赛时间倒序
+    if (newest && Date.now() / 1000 - newest > staleDays * 86400) {
+      await env.GAMES_KV.put(DISABLED_KEY, String(Math.floor(Date.now() / 1000)));
+      return false;
+    }
+  }
+  return true;
+}
+
 export default {
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(scrape(env));
+    if (await scheduledShouldRun(env)) ctx.waitUntil(scrape(env));
   },
 
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (url.pathname === "/refresh") {
       try {
+        // 手动触发 = 手动恢复:清除赛事结束标记,Cron 重新生效
+        await env.GAMES_KV.delete(DISABLED_KEY);
         const payload = await scrape(env);
         return new Response(
           `抓取完成:${payload.matches.length} 个系列赛,新抓 ${payload.details_fetched} 局详情,待补 ${payload.pending_details} 局,${payload.errors.length} 条告警`,

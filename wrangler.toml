@@ -14,5 +14,7 @@ binding = "GAMES_KV"
 id = "6db97639c04640838b4d8b47303fc12a"
 preview_id = "GAMES_KV_LOCAL"
 
+# OpenDota API key 用 npx wrangler secret put OPENDOTA_API_KEY 配置(不要写在这里)
+
 [triggers]
 crons = ["*/30 * * * *"]
